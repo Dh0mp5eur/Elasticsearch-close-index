@@ -1,0 +1,205 @@
+#!/usr/bin/perl
+
+=head1 NAME
+
+elasticsearch-close-index - A script to close older elasticsearch indices.
+
+=head1 SYNOPSIS
+
+    elasticsearch-close-index [ OPTIONS ]
+
+    elasticsearch-close-index --help
+
+=head1 REPORTING BUGS
+
+Please report all bugs to <root(at)neotion.com>.
+
+=head1 AUTHOR
+
+Florian Dhomps <fdhomps(at)neotion.com>.
+
+=head1 POWERED BY
+
+  _  _ ___ ___ _____ ___ ___  _  _ 
+ | \| | __/ _ \_   _|_ _/ _ \| \| |
+ | .` | _| (_) || |  | | (_) | .` |
+ |_|\_|___\___/ |_| |___\___/|_|\_|
+                                   
+=head1 FORK FROM
+
+https://github.com/bloonix/logstash-delete-index
+
+=head1 COPYRIGHT
+
+Copyright (C) 2014 by Florian Dhomps. All rights reserved.
+
+=cut
+
+package ES::Index;
+
+use strict;
+use warnings;
+use JSON;
+use LWP::UserAgent;
+use HTTP::Request;
+
+sub close {
+    my ($class, %opts) = @_;
+    my $self = bless \%opts, $class;
+
+    $self->{json} = JSON->new->utf8;
+    $self->{lwp}  = LWP::UserAgent->new();
+
+    if ($self->{auth}) {
+        $self->{auth} = [ split(/:/, $self->{auth}, 2) ];
+    }
+
+    my @time = (localtime(time - ($opts{close} * 86400)))[3,4,5];
+    my $time = sprintf("%04d%02d%02d", $time[2] + 1900, $time[1] + 1, $time[0]);
+    my $uri  = "$opts{proto}://$opts{host}";
+    my $res  = $self->request(GET => "$uri/_status") or die $self->errstr;
+
+    if (!exists $res->{indices} || !scalar keys %{$res->{indices}}) {
+        print "no indices found\n";
+        exit 0;
+    }
+
+    foreach my $index (keys %{$res->{indices}}) {
+        if ($index =~ /^$opts{name}\-(\d\d\d\d)\.(\d\d)\.(\d\d)/) {
+            my $itime = "$1$2$3";
+
+            if ($itime >= $time) {
+                next;
+            }
+
+            if (!$self->{run}) {
+                print "close index '$index' (run=0)\n";
+                next;
+            }
+
+    	    my $clo = $self->request(POST => "$uri/$index/_close") or die $self->errstr;
+
+	    my $status = ($clo->{acknowledged} && $clo->{acknowledged} eq "true") || ($clo->{ok} && $clo->{ok} eq "true")
+	        ? "was successful"
+	        : "failed";
+
+	    print "close index '$index' $status\n";
+        } elsif (!$self->{run}) {
+            print "skip index '$index'\n";
+        }
+    }
+}
+
+sub request {
+    my $self = shift;
+    my $req  = HTTP::Request->new(@_);
+    my $data = undef;
+
+    if ($self->{auth}) {
+        $req->authorization_basic(@{ $self->{auth} });
+    }
+
+    eval {
+        local $SIG{__DIE__} = sub { alarm(0) };
+        local $SIG{ALRM} = sub { die "request timed out after 60 seconds" };
+        alarm(60);
+
+        my $res = $self->{lwp}->request($req);
+
+        if (!$res->is_success) {
+            die "request to elasticsearch failed - ".$res->status_line;
+        }
+
+        alarm(0);
+        $data = $self->{json}->decode($res->content);
+    };
+
+    if ($@) {
+        return $self->errstr($@);
+    }
+
+    if (!$data || ref $data ne "HASH") {
+        return $self->errstr("invalid data structure received from elasticsearch");
+    }
+
+    return $data;
+}
+
+sub errstr {
+    my ($self, $errstr) = @_;
+    $self->{errstr} = $errstr;
+    return undef;
+}
+
+package main;
+
+use strict;
+use warnings;
+use Getopt::Long qw(:config no_ignore_case);
+
+my $progname = do { $0 =~ m!([^/]+)\z!; $1 };
+my $host     = "127.0.0.1:9200";
+my $proto    = "http";
+my $auth     = undef;
+my $name     = "logstash";
+my $close    = undef;
+my $run      = undef;
+my $help     = undef;
+my $version  = undef;
+
+GetOptions(
+    "H|host=s"   => \$host,
+    "p|proto=s"  => \$proto,
+    "a|auth=s"   => \$auth,
+    "i|index=s"  => \$name,
+    "c|close=s"  => \$close,
+    "r|run"      => \$run,
+    "h|help"     => \$help,
+) or exit 1;
+
+if ($help) {
+    print "\nUsage: $progname [ OPTIONS ]\n\n";
+    print "Options:\n\n";
+    print "-H, --host <host:port>\n";
+    print "    The host and port name of the elasticsearch instance.\n";
+    print "    Default: 127.0.0.1:9200\n";
+    print "-p, --proto <http|https>\n";
+    print "    Use http or https to connect to elasticsearch.\n";
+    print "    Default: http\n";
+    print "-a, --auth <username:password>\n";
+    print "    Pass a string to auth via auth basic.\n";
+    print "-i, --index <index> Base name of index index-YY.MM.DD\n";
+    print "    Default: logstash-YY.MM.DD.\n";
+    print "-c, --close <days>\n";
+    print "    Close all indexes that are older than --close days.\n";
+    print "-r, --run\n";
+    print "    This parameter must be set to really close indices.\n";
+    print "    If the parameter is not set then the indices are printed to\n";
+    print "    stdout that would be closed if the parameter --run were set.\n";
+    print "-h, --help\n";
+    print "    Print the help.\n";
+    print "\n";
+    exit 0;
+}
+
+# Simple host:port check.
+if (!$host || $host !~ /^[a-zA-Z0-9\-\.\:]+:\d{0,5}\z/) {
+    print "Missing or invalid value of parameter --host\n";
+    exit 3;
+}
+
+if (!$close || $close !~ /^\d+\z/) {
+    print "Missing or invalid value of parameter --close\n";
+    exit 3;
+}
+
+ES::Index->close(
+    host   => $host,
+    proto  => $proto,
+    auth   => $auth,
+    name   => $name,
+    close  => $close,
+    run    => $run,
+);
+
+exit 0;
